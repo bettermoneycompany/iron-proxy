@@ -25,6 +25,7 @@ import (
 	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/mcpgateway"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	"golang.org/x/net/http2"
 )
 
 // Proxy is the HTTP/HTTPS proxy server. When Mode is TLSModeMITM, the HTTPS
@@ -131,8 +132,15 @@ func New(opts Options) *Proxy {
 		Handler: http.HandlerFunc(p.handleDirectHTTP),
 		TLSConfig: &tls.Config{
 			GetCertificate: p.getCertificate,
+			// Advertise h2 so gRPC clients (grpc-go >=1.67 enforces ALPN)
+			// negotiate HTTP/2 against the MITM leaf cert.
+			NextProtos: []string{"h2", "http/1.1"},
 		},
 	}
+	// Register Go's HTTP/2 server so Serve dispatches h2-negotiated
+	// connections to handleDirectHTTP. ConfigureServer only errors on an
+	// invalid *http2.Server; the zero value is always valid, so unreachable.
+	_ = http2.ConfigureServer(p.httpsServer, &http2.Server{})
 
 	return p
 }
@@ -762,6 +770,10 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 
 func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
+	// gRPC carries its status in HTTP/2 trailers (grpc-status/grpc-message),
+	// which are populated only after the body is fully read; emit them after
+	// the body via the TrailerPrefix convention so the h2 writer flushes them.
+	defer writeTrailers(w, resp)
 	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
 		// If a transform buffered the response body, set Content-Length
 		// from the buffered data. Otherwise preserve the upstream header
@@ -809,8 +821,12 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
-		Proxy:                 proxyFunc,
-		DialContext:           dialer.DialContext,
+		Proxy:       proxyFunc,
+		DialContext: dialer.DialContext,
+		// A custom DialContext disables net/http's automatic HTTP/2; force the
+		// attempt so h2-capable upstreams (e.g. gRPC) negotiate h2 via ALPN,
+		// while HTTP/1.1 upstreams keep working via fallback.
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -850,6 +866,19 @@ func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		for _, v := range vs {
 			dst.Add(k, v)
+		}
+	}
+}
+
+// writeTrailers forwards any HTTP trailers from the upstream response to the
+// client. resp.Trailer is populated only after the body has been fully read,
+// so this must run after the body copy. Using http.TrailerPrefix lets the
+// server send trailers that were not pre-declared in the header block, which
+// is how gRPC delivers grpc-status/grpc-message.
+func writeTrailers(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Trailer {
+		for _, v := range vs {
+			w.Header().Add(http.TrailerPrefix+k, v)
 		}
 	}
 }

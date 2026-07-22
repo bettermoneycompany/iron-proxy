@@ -21,6 +21,7 @@ import (
 
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	"golang.org/x/net/http2"
 )
 
 // listenTunnel starts the CONNECT/SOCKS5 tunnel listener.
@@ -380,6 +381,9 @@ func (p *Proxy) serveTunnelTLS(clientConn net.Conn, target string, tunnelInfo *t
 
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		GetCertificate: p.getCertificate,
+		// Advertise h2 so tunnelled gRPC clients negotiate HTTP/2 (grpc-go
+		// >=1.67 rejects a TLS peer that selects no ALPN protocol).
+		NextProtos: []string{"h2", "http/1.1"},
 	})
 	defer func() { _ = tlsConn.Close() }()
 
@@ -422,6 +426,10 @@ func serveOneHTTPConn(conn net.Conn, handler http.Handler) error {
 			}
 		},
 	}
+	// Serve HTTP/2 when a tunnelled TLS conn negotiated "h2" (e.g. gRPC).
+	// No-op for plain-HTTP tunnels, which never negotiate ALPN. ConfigureServer
+	// only errors on an invalid *http2.Server; the zero value is always valid.
+	_ = http2.ConfigureServer(srv, &http2.Server{})
 	err := srv.Serve(ln)
 	// A hijacking handler (WebSocket relay, CONNECT tunnel) owns the
 	// connection until it returns. Serve comes back as soon as the hijack
