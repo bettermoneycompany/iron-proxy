@@ -774,6 +774,27 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 	// which are populated only after the body is fully read; emit them after
 	// the body via the TrailerPrefix convention so the h2 writer flushes them.
 	defer writeTrailers(w, resp)
+	// TEMP h2 diagnostic (Temporal only): record the upstream protocol and
+	// trailer state so we can tell whether proxy->upstream negotiated h2 and
+	// whether gRPC trailers were captured. Remove once the gRPC path is proven.
+	if r := resp.Request; r != nil {
+		host := r.Host
+		if host == "" && r.URL != nil {
+			host = r.URL.Host
+		}
+		if strings.Contains(host, "tmprl.cloud") {
+			keys := make([]string, 0, len(resp.Trailer))
+			for k := range resp.Trailer {
+				keys = append(keys, k)
+			}
+			p.logger.Info("h2-diag upstream response",
+				slog.String("proto", resp.Proto),
+				slog.Int("status", resp.StatusCode),
+				slog.Int("trailer_count", len(resp.Trailer)),
+				slog.Any("trailer_keys", keys),
+				slog.String("content_type", resp.Header.Get("Content-Type")))
+		}
+	}
 	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
 		// If a transform buffered the response body, set Content-Length
 		// from the buffered data. Otherwise preserve the upstream header
@@ -820,6 +841,11 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
+			// Explicitly offer h2 in ALPN. ForceAttemptHTTP2 configures h2, but
+			// being explicit guards against environments where the negotiated
+			// protocol silently falls back to HTTP/1.1 (which would drop gRPC
+			// trailers). h2 is preferred; http/1.1 remains the fallback.
+			NextProtos: []string{"h2", "http/1.1"},
 		},
 		Proxy:       proxyFunc,
 		DialContext: dialer.DialContext,
